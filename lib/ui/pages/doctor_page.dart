@@ -45,7 +45,6 @@ class _DoctorPageState extends State<DoctorPage> {
   Widget build(BuildContext context) {
     final checks = widget.appState.doctorChecks;
     final running = widget.appState.doctorRunning;
-    final activeTitle = widget.appState.doctorRunningTitle;
     final failed = checks.where((check) => check.state == DoctorState.fail).length;
     final checksByTitle = {for (final check in checks) check.title: check};
 
@@ -80,7 +79,7 @@ class _DoctorPageState extends State<DoctorPage> {
           return _CheckTile(
             title: title,
             check: check,
-            loading: running && activeTitle == title,
+            loading: running && check == null,
             repairing: _repairingTitle == title,
             onRepair: check?.state == DoctorState.fail && check!.repairable && !running
                 ? () => _repairCheck(check)
@@ -125,18 +124,21 @@ class _CheckTileState extends State<_CheckTile> {
       DoctorState.pass => AppStatusTone.live,
       DoctorState.warn => AppStatusTone.warn,
       DoctorState.fail => AppStatusTone.error,
+      DoctorState.skip => AppStatusTone.idle,
       null => AppStatusTone.idle,
     };
     final label = switch (state) {
       DoctorState.pass => '通过',
       DoctorState.warn => '注意',
       DoctorState.fail => '失败',
+      DoctorState.skip => '跳过',
       null => '等待',
     };
     final color = switch (state) {
       DoctorState.pass => AppTones.success,
       DoctorState.warn => AppTones.warning,
       DoctorState.fail => theme.colorScheme.destructive,
+      DoctorState.skip => theme.colorScheme.mutedForeground,
       null => theme.colorScheme.mutedForeground,
     };
     final detail = widget.loading ? '正在检查…' : widget.check?.detail ?? '等待检查';
@@ -257,6 +259,7 @@ class _CheckTileState extends State<_CheckTile> {
 
   static IconData _iconFor(String title) {
     return switch (title) {
+      '网络代理' => BootstrapIcons.globe,
       'Cloudflared' => BootstrapIcons.cloud,
       'Cloudflare 登录' => BootstrapIcons.check2,
       'Tunnel 配置' => BootstrapIcons.gear,

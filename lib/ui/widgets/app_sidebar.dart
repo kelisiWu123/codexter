@@ -1,4 +1,5 @@
 import 'package:shadcn_flutter/shadcn_flutter.dart';
+import '../../services/doctor_service.dart';
 import '../../stores/app_state.dart';
 import '../../app_info.dart';
 import '../theme/app_theme.dart';
@@ -64,6 +65,9 @@ class AppSidebar extends StatelessWidget {
                   _NavItem(
                     icon: BootstrapIcons.activity,
                     label: '环境检查',
+                    badge: appState.doctorRunning ? null : _doctorFailedCount,
+                    badgeFault: true,
+                    badgeLoading: appState.doctorRunning,
                     active: _isActive(AppPage.doctor),
                     onPressed: () => appState.setCurrentPage(AppPage.doctor),
                   ),
@@ -90,6 +94,11 @@ class AppSidebar extends StatelessWidget {
 
   String? get _enabledMcpCount {
     final count = appState.mcps.where((mcp) => mcp.enabled).length;
+    return count == 0 ? null : '$count';
+  }
+
+  String? get _doctorFailedCount {
+    final count = appState.doctorChecks.where((check) => check.state == DoctorState.fail).length;
     return count == 0 ? null : '$count';
   }
 
@@ -292,6 +301,8 @@ class _NavItem extends StatefulWidget {
   final String label;
   final String? caption;
   final String? badge;
+  final bool badgeFault;
+  final bool badgeLoading;
   final bool active;
   final VoidCallback onPressed;
 
@@ -303,6 +314,8 @@ class _NavItem extends StatefulWidget {
     this.leading,
     this.caption,
     this.badge,
+    this.badgeFault = false,
+    this.badgeLoading = false,
   });
 
   @override
@@ -398,9 +411,14 @@ class _NavItemState extends State<_NavItem> {
                         ],
                       ),
                     ),
-                    if (widget.badge != null) ...[
+                    if (widget.badgeLoading) ...[
                       const Gap(AppSpacing.xs),
-                      AppTag(label: widget.badge!),
+                      const SizedBox.square(dimension: 14, child: CircularProgressIndicator()),
+                    ] else if (widget.badge != null) ...[
+                      const Gap(AppSpacing.xs),
+                      widget.badgeFault
+                          ? _FaultBadge(count: widget.badge!)
+                          : AppTag(label: widget.badge!),
                     ],
                   ],
                 ),
@@ -415,6 +433,36 @@ class _NavItemState extends State<_NavItem> {
   void _setHovered(bool value) {
     if (_hovered == value || !mounted) return;
     setState(() => _hovered = value);
+  }
+}
+
+class _FaultBadge extends StatelessWidget {
+  final String count;
+
+  const _FaultBadge({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.destructive;
+    return SizedBox(
+      width: 18,
+      height: 18,
+      child: DecoratedBox(
+        decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        child: Center(
+          child: Text(
+            count,
+            style: theme.typography.sans.copyWith(
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              height: 1,
+              color: const Color(0xFFFFFFFF),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 

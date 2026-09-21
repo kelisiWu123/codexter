@@ -88,9 +88,7 @@ class CapabilityRuntime extends ChangeNotifier {
   }
 
   Future<void> shutdown() async {
-    for (final client in _clients.values) {
-      await client.close();
-    }
+    await Future.wait(_clients.values.map((client) => client.close()));
     _clients.clear();
   }
 
