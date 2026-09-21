@@ -55,6 +55,7 @@ class TunnelService extends ChangeNotifier {
   bool _running = false;
   TunnelReadyInfo? _readyInfo;
   String? _configPath;
+  int _lifecycleGeneration = 0;
 
   bool get isRunning => _running;
   TunnelReadyInfo? get readyInfo => _readyInfo;
@@ -69,6 +70,7 @@ class TunnelService extends ChangeNotifier {
   }) async {
     if (_running) throw Exception('Tunnel 已在运行');
 
+    final generation = ++_lifecycleGeneration;
     _configPath = configPath;
     _log.clear();
     _appendLog('---- ${DateTime.now().toIso8601String()} start tunnel $tunnelId ----\n');
@@ -78,9 +80,10 @@ class TunnelService extends ChangeNotifier {
       _appendLog('---- stopped $stopped leftover cloudflared owned by this app ----\n');
       await Future<void>.delayed(const Duration(milliseconds: 400));
     }
+    if (generation != _lifecycleGeneration) throw StateError('Tunnel 启动已取消');
 
     final completer = Completer<TunnelReadyInfo>();
-    _process = await Process.start(bin, [
+    final process = await Process.start(bin, [
       'tunnel',
       '--config',
       configPath,
@@ -91,11 +94,16 @@ class TunnelService extends ChangeNotifier {
       'run',
       tunnelId,
     ], environment: Platform.environment);
-    final attached = WinKillOnCloseJob.assignPid(_process!.pid);
+    if (generation != _lifecycleGeneration) {
+      await _terminateProcess(process);
+      throw StateError('Tunnel 启动已取消');
+    }
+    _process = process;
+    final attached = WinKillOnCloseJob.assignPid(process.pid);
     if (attached || WinKillOnCloseJob.boundCurrentProcess) {
-      _appendLog('---- cloudflared pid=${_process!.pid} will exit with app ----\n');
+      _appendLog('---- cloudflared pid=${process.pid} will exit with app ----\n');
     } else if (Platform.isWindows) {
-      _appendLog('---- cloudflared pid=${_process!.pid} may survive if the app is killed ----\n');
+      _appendLog('---- cloudflared pid=${process.pid} may survive if the app is killed ----\n');
     }
     _running = true;
     notifyListeners();
@@ -114,13 +122,16 @@ class TunnelService extends ChangeNotifier {
       });
     }
 
-    watch(_process!.stdout);
-    watch(_process!.stderr);
+    watch(process.stdout);
+    watch(process.stderr);
 
-    _process!.exitCode.then((code) {
+    process.exitCode.then((code) {
       _appendLog('---- cloudflared exited code=$code ----\n');
-      _running = false;
-      notifyListeners();
+      if (identical(_process, process)) {
+        _process = null;
+        _running = false;
+        notifyListeners();
+      }
       if (!completer.isCompleted) {
         completer.completeError(
           TunnelProcessException(exitCode: code, message: 'cloudflared 在隧道就绪前退出', log: _log.text),
@@ -148,29 +159,32 @@ class TunnelService extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _lifecycleGeneration++;
     final process = _process;
     _process = null;
     _running = false;
     _readyInfo = null;
     notifyListeners();
 
-    if (process != null) {
-      try {
-        process.kill(ProcessSignal.sigterm);
-        await process.exitCode.timeout(
-          const Duration(seconds: 3),
-          onTimeout: () {
-            process.kill(ProcessSignal.sigkill);
-            return -1;
-          },
-        );
-      } catch (_) {}
-    }
+    if (process != null) await _terminateProcess(process);
 
     final configPath = _configPath;
     if (configPath != null) {
       await TunnelProcessGuard.stopOwned(configPath: configPath);
     }
+  }
+
+  Future<void> _terminateProcess(Process process) async {
+    try {
+      process.kill(ProcessSignal.sigterm);
+      await process.exitCode.timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {
+          process.kill(ProcessSignal.sigkill);
+          return -1;
+        },
+      );
+    } catch (_) {}
   }
 
   Future<bool> verifyRoute(String publicUrl, {int attempts = 10, int timeoutMs = 5000}) async {

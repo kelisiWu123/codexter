@@ -126,10 +126,24 @@ class _CodexterAppState extends State<CodexterApp> with WindowListener, WidgetsB
     if (_exiting) return;
     if (await desktopPlatform.requestExit()) return;
     _exiting = true;
-    await _trayService.dispose();
-    await widget.appState.shutdown();
-    await windowManager.setPreventClose(false);
-    await windowManager.close();
+    try {
+      await Future.wait([
+        _runExitCleanup('托盘', _trayService.dispose),
+        _runExitCleanup('应用服务', widget.appState.shutdown),
+      ]);
+      await windowManager.setPreventClose(false);
+      await windowManager.close();
+    } finally {
+      _exiting = false;
+    }
+  }
+
+  Future<void> _runExitCleanup(String label, Future<void> Function() cleanup) async {
+    try {
+      await cleanup();
+    } catch (error, stackTrace) {
+      debugPrint('$label清理失败，继续退出：$error\n$stackTrace');
+    }
   }
 
   @override

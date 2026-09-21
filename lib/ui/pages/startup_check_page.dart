@@ -1,8 +1,9 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:shadcn_flutter/shadcn_flutter.dart';
 
 import '../../app_info.dart';
-import '../../services/doctor_service.dart';
-import '../../services/tunnel_error_classifier.dart';
 import '../../stores/app_state.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_components.dart';
@@ -20,71 +21,100 @@ class StartupCheckPage extends StatefulWidget {
 }
 
 class _StartupCheckPageState extends State<StartupCheckPage> {
-  List<DoctorCheck> _checks = const [];
-  String _status = '正在准备运行环境…';
-  String? _activeTitle;
-  String? _repairingTitle;
-  String? _repairError;
-  bool _checking = true;
+  static const _stepLabels = ['本地服务', '启动隧道', '连接边缘', '完成注册'];
+
+  bool _starting = true;
+  String? _error;
+  int _stageIndex = 0;
+  bool _retrying = false;
+
+  AppState get _appState => widget.appState;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _runChecks());
+    _appState.addListener(_refresh);
+    _appState.tunnelService.addListener(_refresh);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _start());
   }
 
-  List<DoctorCheck> get _failedChecks =>
-      _checks.where((check) => check.state == DoctorState.fail).toList();
+  @override
+  void dispose() {
+    _appState.removeListener(_refresh);
+    _appState.tunnelService.removeListener(_refresh);
+    super.dispose();
+  }
 
-  Future<void> _runChecks() async {
+  void _refresh() {
+    if (!mounted || !_starting) return;
+    setState(_syncStage);
+  }
+
+  void _syncStage() {
+    final log = _appState.tunnelService.logTail;
+    var reached = 0;
+    var retrying = false;
+    if (_appState.config.useCloudflared) {
+      for (final line in log.split(RegExp(r'\r?\n'))) {
+        if (line.contains('Starting tunnel') || line.contains('start tunnel')) {
+          reached = 1;
+        }
+        if (line.contains('curve preferences') ||
+            line.contains('Initial protocol') ||
+            line.contains('CONNECTIVITY PRE-CHECKS') ||
+            line.toLowerCase().contains('precheck')) {
+          reached = 2;
+        }
+        if (line.contains('Failed to dial') || line.contains('Retrying connection')) {
+          reached = 2;
+          retrying = true;
+        }
+        if (line.contains('Registered tunnel connection')) {
+          reached = 3;
+          retrying = false;
+        }
+      }
+    }
+    if (reached > _stageIndex) _stageIndex = reached;
+    _retrying = retrying && _stageIndex == 2;
+  }
+
+  void _enterMain() {
+    unawaited(_appState.runDoctor());
+    widget.onContinue();
+  }
+
+  Future<void> _start() async {
     if (!mounted) return;
     setState(() {
-      _checks = const [];
-      _checking = true;
-      _repairError = null;
-      _activeTitle = null;
-      _status = '正在启动本地服务…';
+      _starting = true;
+      _error = null;
+      _stageIndex = 0;
+      _retrying = false;
     });
 
     try {
-      final checks = await widget.appState.runStartupChecks(
-        onStatus: (status) {
-          if (!mounted) return;
-          setState(() => _status = status);
-        },
-        onCheckStart: (title) {
-          if (!mounted) return;
-          setState(() {
-            _activeTitle = title;
-            _status = '正在检查 $title…';
-          });
-        },
-        onCheckComplete: (check) {
-          if (!mounted) return;
-          setState(() {
-            _checks = [..._checks, check];
-          });
-        },
-      );
+      await _appState.startServices();
       if (!mounted) return;
-      final failed = checks.where((check) => check.state == DoctorState.fail).toList();
-      setState(() {
-        _checks = checks;
-        _activeTitle = null;
-        _checking = false;
-        _status = failed.isEmpty ? '运行环境检查通过' : '发现 ${failed.length} 项需要处理';
-      });
-      if (failed.isEmpty) {
-        await Future<void>.delayed(const Duration(milliseconds: 420));
-        if (mounted) widget.onContinue();
+      if (_appState.config.useCloudflared && !_appState.tunnelRunning) {
+        setState(() {
+          _starting = false;
+          _error = _appState.lastErrorSummary ?? '隧道未在时限内就绪';
+        });
+        return;
       }
+      setState(() {
+        _stageIndex = _appState.config.useCloudflared ? 3 : 0;
+        _retrying = false;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 480));
+      if (!mounted) return;
+      _enterMain();
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _checking = false;
-        _activeTitle = null;
-        _status = '启动检测未完成';
-        _repairError = '$error';
+        _starting = false;
+        _error = '$error';
       });
     }
   }
@@ -92,45 +122,24 @@ class _StartupCheckPageState extends State<StartupCheckPage> {
   Future<void> _showProxySettings() async {
     final saved = await ProxySettingsDialog.show(
       context: context,
-      appState: widget.appState,
+      appState: _appState,
       description: '如果当前网络无法稳定连接 Cloudflare，可在这里配置 HTTP 或 SOCKS5 代理。',
     );
     if (mounted && saved) setState(() {});
   }
 
-  Future<void> _repair(DoctorCheck check) async {
-    if (_repairingTitle != null) return;
-    setState(() {
-      _repairingTitle = check.title;
-      _repairError = null;
-    });
-    try {
-      await widget.appState.repairDoctorCheck(check);
-      if (!mounted) return;
-      await _runChecks();
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _checking = false;
-        _repairError = '$error';
-      });
-    } finally {
-      if (mounted) setState(() => _repairingTitle = null);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final failed = _failedChecks;
-    final showFailures = !_checking && (failed.isNotEmpty || _repairError != null);
+    final failed = !_starting && _error != null;
+    final steps = _appState.config.useCloudflared ? _stepLabels : _stepLabels.take(1).toList();
 
     return Scaffold(
       child: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
             colors: [
               theme.colorScheme.background,
               AppTones.surfaceRaised(theme),
@@ -142,107 +151,65 @@ class _StartupCheckPageState extends State<StartupCheckPage> {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(AppSpacing.x2l),
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 620),
+              constraints: const BoxConstraints(maxWidth: 460),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Image.asset(
                     appLogoAsset,
-                    width: 52,
-                    height: 52,
+                    width: 56,
+                    height: 56,
                     filterQuality: FilterQuality.high,
                   ),
                   const Gap(AppSpacing.xl),
                   Text(
-                    showFailures ? '运行环境需要处理' : '正在启动 $appName',
-                    style: AppTones.title(theme, size: 16),
+                    failed ? 'Tunnel 需要处理' : '正在启动 $appName',
+                    style: AppTones.title(theme, size: 18),
                   ),
-                  const Gap(AppSpacing.sm),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (_checking) ...[
-                        const SizedBox.square(dimension: 14, child: CircularProgressIndicator()),
-                        const Gap(AppSpacing.sm),
-                      ],
-                      Flexible(
-                        child: Text(
-                          _status,
-                          textAlign: TextAlign.center,
-                          style: AppTones.muted(theme, size: 12),
-                        ),
-                      ),
-                    ],
+                  const Gap(AppSpacing.x2l),
+                  _StartupStepper(
+                    labels: steps,
+                    currentIndex: _stageIndex.clamp(0, steps.length - 1),
+                    failed: failed,
+                    retrying: _retrying,
                   ),
-                  if (_checking && _activeTitle != null) ...[
-                    const Gap(AppSpacing.xs),
-                    AppMonoText(
-                      '${_checks.length + 1} / ${DoctorService.startupCheckTitles.length}',
-                      size: 10.5,
-                    ),
-                  ],
-                  if (showFailures) ...[
+                  if (failed) ...[
                     const Gap(AppSpacing.x2l),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(AppSpacing.lg),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.card.withValues(alpha: 0.92),
-                        borderRadius: BorderRadius.circular(theme.radiusXl),
-                        border: Border.all(color: theme.colorScheme.border),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          for (final check in failed) ...[
-                            _StartupIssueTile(
-                              check: check,
-                              repairing: _repairingTitle == check.title,
-                              onRepair: check.repairable ? () => _repair(check) : null,
-                            ),
-                            if (check != failed.last) const Gap(AppSpacing.sm),
-                          ],
-                          if (_repairError != null) ...[
-                            if (failed.isNotEmpty) const Gap(AppSpacing.md),
-                            AppNotice(
-                              tone: AppNoticeTone.danger,
-                              message: '自动修复失败',
-                              detail: _repairError,
-                              detailMaxLines: 6,
-                            ),
-                          ],
-                          const Gap(AppSpacing.lg),
-                          Row(
-                            children: [
-                              Button(
-                                style: ButtonStyle.outline(size: ButtonSize.normal),
-                                onPressed: _repairingTitle == null ? _showProxySettings : null,
-                                child: AppButtonLabel(
-                                  icon: BootstrapIcons.globe,
-                                  label: widget.appState.config.proxyEnabled
-                                      ? '网络代理 · ${Uri.tryParse(widget.appState.config.proxyUrl)?.scheme.toUpperCase() ?? 'HTTP'}'
-                                      : '网络代理',
-                                ),
-                              ),
-                              const Spacer(),
-                              Button(
-                                style: ButtonStyle.outline(size: ButtonSize.normal),
-                                onPressed: _repairingTitle == null ? _runChecks : null,
-                                child: const AppButtonLabel(
-                                  icon: BootstrapIcons.arrowRepeat,
-                                  label: '重新检测',
-                                ),
-                              ),
-                              const Gap(AppSpacing.sm),
-                              Button(
-                                style: ButtonStyle.primary(size: ButtonSize.normal),
-                                onPressed: _repairingTitle == null ? widget.onContinue : null,
-                                child: const Text('仍然进入主页面'),
-                              ),
-                            ],
+                    AppNotice(
+                      tone: AppNoticeTone.danger,
+                      message: '暂时没有连上 Tunnel',
+                      detail: '可以换网络或配置代理后重试，也可以先进入主页面。',
+                      detailMaxLines: 3,
+                    ),
+                    const Gap(AppSpacing.lg),
+                    Row(
+                      children: [
+                        Button(
+                          style: ButtonStyle.outline(size: ButtonSize.normal),
+                          onPressed: _showProxySettings,
+                          child: AppButtonLabel(
+                            icon: BootstrapIcons.globe,
+                            label: _appState.config.proxyEnabled
+                                ? '网络代理 · ${Uri.tryParse(_appState.config.proxyUrl)?.scheme.toUpperCase() ?? 'HTTP'}'
+                                : '网络代理',
                           ),
-                        ],
-                      ),
+                        ),
+                        const Spacer(),
+                        Button(
+                          style: ButtonStyle.outline(size: ButtonSize.normal),
+                          onPressed: _start,
+                          child: const AppButtonLabel(
+                            icon: BootstrapIcons.arrowRepeat,
+                            label: '重新连接',
+                          ),
+                        ),
+                        const Gap(AppSpacing.sm),
+                        Button(
+                          style: ButtonStyle.primary(size: ButtonSize.normal),
+                          onPressed: _enterMain,
+                          child: const Text('仍然进入'),
+                        ),
+                      ],
                     ),
                   ],
                 ],
@@ -255,100 +222,205 @@ class _StartupCheckPageState extends State<StartupCheckPage> {
   }
 }
 
-class _StartupIssueTile extends StatelessWidget {
-  final DoctorCheck check;
-  final bool repairing;
-  final VoidCallback? onRepair;
+class _StartupStepper extends StatelessWidget {
+  final List<String> labels;
+  final int currentIndex;
+  final bool failed;
+  final bool retrying;
 
-  const _StartupIssueTile({required this.check, required this.repairing, required this.onRepair});
+  const _StartupStepper({
+    required this.labels,
+    required this.currentIndex,
+    required this.failed,
+    required this.retrying,
+  });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final color = theme.colorScheme.destructive;
-    final raw = check.rawError?.trim();
+    final pendingLine = theme.colorScheme.mutedForeground.withValues(alpha: 0.28);
+    final doneLine = AppTones.success.withValues(alpha: 0.55);
 
-    return Container(
-      padding: const EdgeInsets.all(AppSpacing.md),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.055),
-        borderRadius: BorderRadius.circular(theme.radiusLg),
-        border: Border.all(color: color.withValues(alpha: 0.2)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Container(
-            width: 34,
-            height: 34,
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(theme.radiusMd),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final stepWidth = constraints.maxWidth / labels.length;
+        return Stack(
+          children: [
+            Positioned(
+              top: 10,
+              left: stepWidth / 2,
+              right: stepWidth / 2,
+              height: 2,
+              child: Row(
+                children: [
+                  for (var index = 0; index < labels.length - 1; index++)
+                    Expanded(
+                      child: _StepLine(color: index < currentIndex ? doneLine : pendingLine),
+                    ),
+                ],
+              ),
             ),
-            child: Icon(BootstrapIcons.exclamationTriangle, size: 15, color: color),
-          ),
-          const Gap(AppSpacing.md),
-          Expanded(
-            child: Column(
+            Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Flexible(child: Text(check.title, style: AppTones.title(theme, size: 12.5))),
-                    const Gap(AppSpacing.sm),
-                    AppTag(label: _issueLabel(check.issue), color: color),
-                  ],
-                ),
-                const Gap(AppSpacing.xs),
-                Text(
-                  check.detail,
-                  style: AppTones.muted(theme, size: 10.5),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                if (raw != null && raw.isNotEmpty && raw != check.detail) ...[
-                  const Gap(2),
-                  AppMonoText(raw, size: 9.5, maxLines: 2),
-                ],
+                for (var index = 0; index < labels.length; index++)
+                  Expanded(
+                    child: _StartupStep(
+                      label: labels[index],
+                      done:
+                          index < currentIndex ||
+                          (index == currentIndex && !failed && currentIndex == labels.length - 1),
+                      active: index == currentIndex && !failed,
+                      failed: failed && index == currentIndex,
+                      retrying: retrying && index == currentIndex,
+                      theme: theme,
+                    ),
+                  ),
               ],
             ),
-          ),
-          if (onRepair != null) ...[
-            const Gap(AppSpacing.md),
-            Button(
-              style: ButtonStyle.outline(size: ButtonSize.small),
-              onPressed: repairing ? null : onRepair,
-              child: repairing
-                  ? const SizedBox.square(dimension: 12, child: CircularProgressIndicator())
-                  : const Text('修复'),
-            ),
           ],
-        ],
+        );
+      },
+    );
+  }
+}
+
+class _StartupStep extends StatelessWidget {
+  final String label;
+  final bool done;
+  final bool active;
+  final bool failed;
+  final bool retrying;
+  final ThemeData theme;
+
+  const _StartupStep({
+    required this.label,
+    required this.done,
+    required this.active,
+    required this.failed,
+    required this.retrying,
+    required this.theme,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = failed
+        ? theme.colorScheme.destructive
+        : done
+        ? AppTones.success
+        : active
+        ? theme.colorScheme.foreground
+        : theme.colorScheme.mutedForeground.withValues(alpha: 0.42);
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 22,
+          child: Center(
+            child: _StepDot(done: done, active: active, failed: failed, color: color),
+          ),
+        ),
+        const Gap(AppSpacing.sm),
+        Text(
+          label,
+          textAlign: TextAlign.center,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.typography.sans.copyWith(
+            fontSize: 11.5,
+            fontWeight: active || done ? FontWeight.w500 : FontWeight.w400,
+            color: color,
+          ),
+        ),
+        SizedBox(
+          height: 16,
+          child: retrying
+              ? Text('自动重试', textAlign: TextAlign.center, style: AppTones.muted(theme, size: 10))
+              : null,
+        ),
+      ],
+    );
+  }
+}
+
+class _StepDot extends StatelessWidget {
+  final bool done;
+  final bool active;
+  final bool failed;
+  final Color color;
+
+  const _StepDot({
+    required this.done,
+    required this.active,
+    required this.failed,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 22,
+      height: 22,
+      child: Center(
+        child: failed
+            ? Icon(BootstrapIcons.xCircleFill, size: 16, color: color)
+            : done
+            ? Icon(BootstrapIcons.checkCircleFill, size: 16, color: color)
+            : active
+            ? const SizedBox.square(dimension: 14, child: CircularProgressIndicator())
+            : Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: color, width: 1.5),
+                ),
+              ),
       ),
     );
   }
+}
 
-  static String _issueLabel(TunnelIssueCode issue) {
-    return switch (issue) {
-      TunnelIssueCode.cloudflaredMissing => 'CLOUDFLARED-MISSING',
-      TunnelIssueCode.originCertMissing => 'CERT-MISSING',
-      TunnelIssueCode.tunnelMissing => 'TUNNEL-MISSING',
-      TunnelIssueCode.tunnelCredentialsMissing => 'CREDENTIALS-MISSING',
-      TunnelIssueCode.tunnelConfigMissing => 'CONFIG-MISSING',
-      TunnelIssueCode.domainMissing => 'DOMAIN-MISSING',
-      TunnelIssueCode.localServerStopped => 'LOCAL-SERVER-DOWN',
-      TunnelIssueCode.tunnelStopped => 'TUNNEL-DOWN',
-      TunnelIssueCode.dnsMissing => 'DNS-NXDOMAIN',
-      TunnelIssueCode.dnsUnauthorized => 'DNS-AUTH',
-      TunnelIssueCode.cloudflare1016 => 'CF-1016',
-      TunnelIssueCode.cloudflare1033 => 'CF-1033',
-      TunnelIssueCode.originUnreachable => 'ORIGIN-UNREACHABLE',
-      TunnelIssueCode.originTlsError => 'ORIGIN-TLS',
-      TunnelIssueCode.originProtocolMismatch => 'ORIGIN-PROTOCOL',
-      TunnelIssueCode.publicHttpError => 'PUBLIC-HTTP',
-      TunnelIssueCode.timeout => 'TIMEOUT',
-      TunnelIssueCode.unknown => 'UNKNOWN',
-      TunnelIssueCode.none => 'OK',
-    };
+class _StepLine extends StatelessWidget {
+  final Color color;
+
+  const _StepLine({required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      child: CustomPaint(
+        painter: _DashedLinePainter(color: color),
+        child: const SizedBox(height: 2, width: double.infinity),
+      ),
+    );
+  }
+}
+
+class _DashedLinePainter extends CustomPainter {
+  final Color color;
+
+  const _DashedLinePainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 0.8
+      ..strokeCap = StrokeCap.round;
+    const dash = 3.0;
+    const gap = 4.0;
+    final y = size.height / 2;
+    var x = 0.0;
+    while (x < size.width) {
+      canvas.drawLine(Offset(x, y), Offset(math.min(x + dash, size.width), y), paint);
+      x += dash + gap;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashedLinePainter oldDelegate) {
+    return oldDelegate.color != color;
   }
 }

@@ -43,9 +43,7 @@ class MultiWorkspaceServer {
   }
 
   Future<void> stop() async {
-    for (final handler in _handlers.values) {
-      await handler.close();
-    }
+    await Future.wait(_handlers.values.map((handler) => handler.close()));
     _handlers.clear();
     final server = _server;
     _server = null;

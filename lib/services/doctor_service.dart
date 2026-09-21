@@ -8,7 +8,7 @@ import 'network_proxy.dart';
 import 'setup_service.dart';
 import 'tunnel_error_classifier.dart';
 
-enum DoctorState { pass, warn, fail }
+enum DoctorState { pass, warn, fail, skip }
 
 class DoctorCheck {
   final String title;
@@ -32,8 +32,6 @@ class DoctorCheck {
 
 /// 环境自检：cloudflared、Cloudflare 登录、Tunnel 配置、本地服务、Git、工作区路径。
 class DoctorService {
-  static const minCheckDisplayDuration = Duration(milliseconds: 200);
-
   static const checkTitles = <String>[
     'Cloudflared',
     'Cloudflare 登录',
@@ -44,16 +42,7 @@ class DoctorService {
     '公网连通性',
     'Git',
     '工作区路径',
-  ];
-
-  static const startupCheckTitles = <String>[
-    'Cloudflared',
-    'Cloudflare 登录',
-    'Tunnel 配置',
-    '公网域名',
-    '本地 MCP 服务',
-    'Cloudflare Tunnel',
-    '公网连通性',
+    '网络代理',
   ];
 
   Future<List<DoctorCheck>> runAll({
@@ -77,27 +66,6 @@ class DoctorService {
     );
   }
 
-  Future<List<DoctorCheck>> runStartup({
-    required GlobalConfig config,
-    required List<Workspace> workspaces,
-    required bool serverRunning,
-    required bool tunnelRunning,
-    String? tunnelError,
-    void Function(String title)? onCheckStart,
-    void Function(DoctorCheck check)? onCheckComplete,
-  }) async {
-    return _run(
-      config: config,
-      workspaces: workspaces,
-      serverRunning: serverRunning,
-      tunnelRunning: tunnelRunning,
-      tunnelError: tunnelError,
-      includeOptional: false,
-      onCheckStart: onCheckStart,
-      onCheckComplete: onCheckComplete,
-    );
-  }
-
   Future<List<DoctorCheck>> _run({
     required GlobalConfig config,
     required List<Workspace> workspaces,
@@ -108,48 +76,76 @@ class DoctorService {
     void Function(String title)? onCheckStart,
     void Function(DoctorCheck check)? onCheckComplete,
   }) async {
-    final results = <DoctorCheck>[];
-
-    Future<void> run(String title, Future<DoctorCheck> Function() check) async {
+    Future<DoctorCheck> run(String title, Future<DoctorCheck> Function() check) async {
       onCheckStart?.call(title);
-      final stopwatch = Stopwatch()..start();
-      final result = await check();
-      final remaining = minCheckDisplayDuration - stopwatch.elapsed;
-      if (remaining > Duration.zero) {
-        await Future<void>.delayed(remaining);
+      DoctorCheck result;
+      try {
+        result = await check();
+      } catch (error) {
+        result = DoctorCheck(
+          title: title,
+          state: DoctorState.fail,
+          detail: '检查未完成：$error',
+          hint: '处理上述错误后重新检查。',
+          rawError: '$error',
+        );
       }
-      results.add(result);
       onCheckComplete?.call(result);
+      return result;
     }
 
-    await run(checkTitles[0], () => _checkCloudflaredBin(config));
-    await run(checkTitles[1], () => _checkCloudflareLogin(config));
-    await run(checkTitles[2], () => _checkTunnelConfig(config));
-    await run(checkTitles[3], () async => _checkDomain(config));
-    await run(checkTitles[4], () async => _checkServer(config, serverRunning));
-    await run(checkTitles[5], () async => _checkTunnel(config, tunnelRunning, tunnelError));
-    await run(checkTitles[6], () => _checkPublicRoute(config));
-
+    final checks = <Future<DoctorCheck>>[
+      run(checkTitles[0], () => _checkCloudflaredBin(config)),
+      run(checkTitles[1], () => _checkCloudflareLogin(config)),
+      run(checkTitles[2], () => _checkTunnelConfig(config)),
+      run(checkTitles[3], () async => _checkDomain(config)),
+      run(checkTitles[4], () async => _checkServer(config, serverRunning)),
+      run(checkTitles[5], () async => _checkTunnel(config, tunnelRunning, tunnelError)),
+      run(checkTitles[6], () => _checkPublicRoute(config)),
+    ];
     if (includeOptional) {
-      await run(checkTitles[7], _checkGit);
-      await run(checkTitles[8], () => _checkWorkspacePaths(workspaces));
+      checks.add(run(checkTitles[7], _checkGit));
+      checks.add(run(checkTitles[8], () => _checkWorkspacePaths(workspaces)));
     }
-
-    return results;
+    checks.add(run(checkTitles[9], () => _checkProxy(config)));
+    return Future.wait(checks);
   }
 
   DoctorCheck _cloudflareSkipped(String title) {
     return DoctorCheck(title: title, state: DoctorState.warn, detail: '跳过（未启用 Cloudflare Tunnel）');
   }
 
+  Future<DoctorCheck> _checkProxy(GlobalConfig config) async {
+    if (!config.proxyEnabled) {
+      return const DoctorCheck(
+        title: '网络代理',
+        state: DoctorState.skip,
+        detail: '未启用',
+      );
+    }
+
+    final url = NetworkProxy.normalizeUrl(config.proxyUrl, enabled: true);
+    try {
+      await NetworkProxy.testConnection(url);
+      return DoctorCheck(
+        title: '网络代理',
+        state: DoctorState.pass,
+        detail: '已启用 · $url',
+      );
+    } catch (error) {
+      return DoctorCheck(
+        title: '网络代理',
+        state: DoctorState.fail,
+        detail: '代理连接失败：$url',
+        rawError: '$error',
+      );
+    }
+  }
+
   Future<DoctorCheck> _checkCloudflaredBin(GlobalConfig config) async {
     if (!config.useCloudflared) return _cloudflareSkipped('Cloudflared');
-    final candidates = <String>[
-      if (config.cloudflaredBin != null) config.cloudflaredBin!,
-      await AppPaths.cloudflaredPath,
-    ];
-    for (final bin in candidates) {
-      if (!await File(bin).exists()) continue;
+    final bin = await SetupService().findCloudflaredBin(configuredPath: config.cloudflaredBin);
+    if (bin != null) {
       try {
         final result = await Process.run(bin, ['--version']);
         if (result.exitCode == 0) {

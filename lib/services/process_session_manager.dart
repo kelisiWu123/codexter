@@ -168,12 +168,14 @@ class ProcessSessionManager extends ChangeNotifier {
 
   Future<void> shutdown() async {
     final sessions = _sessions.values.toList();
-    for (final session in sessions) {
-      try {
-        await _killSession(session);
-      } catch (_) {}
-      session.cleanupTimer?.cancel();
-    }
+    await Future.wait(
+      sessions.map((session) async {
+        try {
+          await _killSession(session);
+        } catch (_) {}
+        session.cleanupTimer?.cancel();
+      }),
+    );
     _sessions.clear();
     _scheduleNotify();
   }
