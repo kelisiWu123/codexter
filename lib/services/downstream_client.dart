@@ -309,7 +309,9 @@ class DownstreamClient {
     if (client == null || url == null) throw Exception('$name 未配置 url');
 
     final request = await client.postUrl(Uri.parse(url));
-    request.headers.contentType = ContentType.json;
+    // Some MCP servers compare the media type literally and reject the
+    // charset parameter emitted by ContentType.json.
+    request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
     request.headers.set(HttpHeaders.acceptHeader, 'application/json, text/event-stream');
     entry.headers.forEach(request.headers.set);
     if (_httpSessionId != null) {

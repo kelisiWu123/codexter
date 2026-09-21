@@ -108,8 +108,10 @@ void main() {
     final processManager = ProcessSessionManager();
     final capabilities = CapabilityRuntime();
     final logStore = LogStore();
+    String? receivedContentType;
 
     final serverTask = server.forEach((request) async {
+      receivedContentType = request.headers.value(HttpHeaders.contentTypeHeader);
       final body = await utf8.decoder.bind(request).join();
       final payload = jsonDecode(body) as Map<String, dynamic>;
       final method = '${payload['method'] ?? ''}';
@@ -163,6 +165,7 @@ void main() {
 
     try {
       await capabilities.syncMcps([entry]);
+      expect(receivedContentType, 'application/json');
       final context = ToolContext(
         workspace: workspace,
         pathGuard: PathGuard(temp.path),
