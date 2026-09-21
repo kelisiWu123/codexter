@@ -117,21 +117,13 @@ class DoctorService {
 
   Future<DoctorCheck> _checkProxy(GlobalConfig config) async {
     if (!config.proxyEnabled) {
-      return const DoctorCheck(
-        title: '网络代理',
-        state: DoctorState.skip,
-        detail: '未启用',
-      );
+      return const DoctorCheck(title: '网络代理', state: DoctorState.skip, detail: '未启用');
     }
 
     final url = NetworkProxy.normalizeUrl(config.proxyUrl, enabled: true);
     try {
       await NetworkProxy.testConnection(url);
-      return DoctorCheck(
-        title: '网络代理',
-        state: DoctorState.pass,
-        detail: '已启用 · $url',
-      );
+      return DoctorCheck(title: '网络代理', state: DoctorState.pass, detail: '已启用 · $url');
     } catch (error) {
       return DoctorCheck(
         title: '网络代理',
